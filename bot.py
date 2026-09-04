@@ -611,8 +611,8 @@ def handle_contact(m: types.Message):
             }
 
             markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-            markup.row("≼ سـلـفـ 𝐕𝐢𝐏 ≽", "≼ شـارژ مـوجـودی 💳 ≽")
-            markup.row("≼ الماس رایگان ≽", "≼ پروفایل ≽")
+            markup.row("≼ سـلـفـ 𝐕𝐢𝐏 🔑 ≽", "≼ شـارژ مـوجـودی 💳 ≽")
+            markup.row("≼ الماس رایگان  🎁 ≽", "≼ پروفایل 👤 ≽")
             bot.send_message(
                 uid,
                 "✅ کد تایید به تلگرام شما ارسال شد.\n📝 لطفاً کد ۵ رقمی را که از تلگرام دریافت کردید را با فاصله وارد کنید مثل  ( 5 4 6 1 2 ) :",
