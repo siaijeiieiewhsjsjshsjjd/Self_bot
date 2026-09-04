@@ -510,7 +510,7 @@ def cmd_start(m: types.Message):
 # ✅ بخش احراز هویت با کد تلگرام
 # ============================================================
 
-@bot.message_handler(func=lambda m: in_private(m) and m.text and m.text.strip() == "≼ سـلـفـ 𝐕𝐢𝐏 ≽")
+@bot.message_handler(func=lambda m: in_private(m) and m.text and m.text.strip() == "≼ سـلـفـ 𝐕𝐢𝐏 🔑 ≽")
 def cmd_self(m: types.Message):
     uid = m.from_user.id
     ensure_user(uid)
@@ -1731,7 +1731,7 @@ def handle_reply_text(m):
         bot.send_message(m.chat.id, "✅ متن منشی پی‌وی تغییر یافت.")
 
 # ----------------- PROFILE -----------------
-@bot.message_handler(func=lambda m: in_private(m) and m.text and m.text.strip() == "≼ پروفایل ≽")
+@bot.message_handler(func=lambda m: in_private(m) and m.text and m.text.strip() == "≼ پروفایل 👤 ≽")
 def cmd_profile(m: types.Message):
     user_id = m.from_user.id
     ensure_user(user_id)
@@ -2273,19 +2273,19 @@ def cmd_setdiamonds(m: types.Message):
 
 # ----------------- PRIVATE MENU -----------------
 @bot.message_handler(func=lambda m: in_private(m) and isinstance(m.text, str) and m.text.strip() in [
-    "≼ سـلـفـ 𝐕𝐢𝐏 ≽", "≼ شـارژ مـوجـودی 💳 ≽", "≼ الماس رایگان ≽", "≼ پروفایل ≽"
+    "≼ سـلـفـ 𝐕𝐢𝐏 🔑 ≽", "≼ شـارژ مـوجـودی 💳 ≽", "≼ الماس رایگان  🎁 ≽", "≼ پروفایل 👤 ≽"
 ])
 def private_menu(m: types.Message):
     txt = m.text.strip()
-    if txt == "≼ سـلـفـ 𝐕𝐢𝐏 ≽":
+    if txt == "≼≼ سـلـفـ 𝐕𝐢𝐏 🔑 ≽":
         cmd_self(m)
     elif txt == "≼ شـارژ مـوجـودی 💳 ≽":
         return bot.reply_to(m, "برای خرید به آیدی‌های زیر مراجعه کنید:\n👤 مالک: @AliZord_yt\n")
-    elif txt == "≼ الماس رایگان ≽":
+    elif txt == "≼ الماس رایگان  🎁 ≽":
         count = get_ref_count(m.from_user.id)
         link = f"https://t.me/{BOT_USERNAME}?start={m.from_user.id}"
         return bot.reply_to(m, FREE_DIAMOND_TEXT.format(count=count, link=link))
-    elif txt == "≼ پروفایل ≽":
+    elif txt == "≼ پروفایل 👤 ≽":
         cmd_profile(m)
 
 # ----------------- BALANCE -----------------
