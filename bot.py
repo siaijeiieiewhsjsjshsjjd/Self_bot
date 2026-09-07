@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-VIP Bot v19 - نسخه ترکیبی ربات + یوزربات
+VIP Bot v19 - نسخه ترکیبی ربات + یوزربات (با دیتابیس MySQL)
 """
 import sqlite3
 import threading
@@ -14,6 +14,8 @@ import re
 import json
 import requests
 from datetime import datetime, timezone, timedelta
+import pymysql
+from pymysql.cursors import DictCursor
 
 import telebot
 from telebot import types
@@ -33,11 +35,10 @@ API_ID = 37386944
 API_HASH = "d64069023db75d11ae5982f653069a98"
 SESSION_NAME = "userbot_session"
 
-# مسیر دیتابیس
+# مسیر دیتابیس (فقط برای فایل sqlite قدیمی، الان از MySQL استفاده می‌کنیم)
 DATA_DIR = os.path.join(os.getcwd(), "data")
 if not os.path.exists(DATA_DIR):
-    os.makedirs(DATA_DIR)
-DB_PATH = os.path.join(DATA_DIR, "vip_bet.db")
+    os.makedirs(DATA_DIR) # برای سازگاری با کدهای قدیمی
 
 DIAMOND_RATE = 40
 REF_BONUS = 40
@@ -64,6 +65,453 @@ ADMIN_STATE = {}
 BLOCKED_USERS = {}          # uid -> set(user_id)
 MUTED_USERS = {}            # uid -> set((chat_id, user_id))
 AUTO_REACTION_TARGETS = {}  # uid -> {str(user_id): emoji}
+
+# ==================== دیتابیس MySQL ====================
+def get_db_connection():
+    """برقراری اتصال به MySQL با استفاده از متغیرهای محیطی"""
+    return pymysql.connect(
+        host=os.environ.get("MYSQLHOST", "mysql.railway.internal"),
+        user=os.environ.get("MYSQLUSER", "root"),
+        password=os.environ.get("MYSQLPASSWORD", "NbjmnZsCZiNnPCKrojqPiEeyChksPusC"),
+        database=os.environ.get("MYSQLDATABASE", "railway"),
+        port=int(os.environ.get("MYSQLPORT", 3306)),
+        charset='utf8mb4',
+        cursorclass=DictCursor,
+        autocommit=False
+    )
+
+def init_db():
+    """ایجاد جداول مورد نیاز در MySQL"""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            # جدول users
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id BIGINT PRIMARY KEY,
+                    diamonds INT DEFAULT 0,
+                    created_at INT,
+                    is_self_active INT DEFAULT 0,
+                    self_active_time INT DEFAULT 0
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
+            # جدول settings
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS settings (
+                    `key` VARCHAR(255) PRIMARY KEY,
+                    value TEXT
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
+            # جدول referrals
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS referrals (
+                    user_id BIGINT PRIMARY KEY,
+                    `count` INT DEFAULT 0
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
+            # جدول ref_used
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS ref_used (
+                    user_id BIGINT PRIMARY KEY,
+                    referrer_id BIGINT
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
+            # جدول bets
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS bets (
+                    bet_id INT AUTO_INCREMENT PRIMARY KEY,
+                    chat_id BIGINT,
+                    creator_id BIGINT,
+                    amount INT,
+                    state VARCHAR(20),
+                    player_joined_id BIGINT,
+                    message_id BIGINT,
+                    created_at INT
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
+            # جدول self_settings
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS self_settings (
+                    user_id BIGINT PRIMARY KEY,
+                    text_mode VARCHAR(20) DEFAULT 'normal',
+                    is_clock_on INT DEFAULT 0,
+                    font_style VARCHAR(20) DEFAULT 'font1',
+                    action_mode VARCHAR(20) DEFAULT 'none',
+                    is_auto_reply_on INT DEFAULT 0,
+                    auto_reply_text TEXT DEFAULT '',
+                    base_first_name TEXT DEFAULT '',
+                    base_last_name TEXT DEFAULT '',
+                    is_bio_on INT DEFAULT 0,
+                    is_seen_on INT DEFAULT 0,
+                    is_typing_on INT DEFAULT 0,
+                    anti_raid INT DEFAULT 0,
+                    tabchi_on INT DEFAULT 0,
+                    tabchi_text TEXT DEFAULT 'سلام 👋 پیام شما دریافت شد.',
+                    bold_mode INT DEFAULT 0,
+                    auto_save INT DEFAULT 0,
+                    anti_report INT DEFAULT 1,
+                    enemy_active INT DEFAULT 0,
+                    friend_active INT DEFAULT 0,
+                    crash_active INT DEFAULT 0,
+                    pv_lock INT DEFAULT 0,
+                    pv_photo INT DEFAULT 0,
+                    pv_video INT DEFAULT 0,
+                    pv_gif INT DEFAULT 0,
+                    pv_voice INT DEFAULT 0,
+                    pv_music INT DEFAULT 0,
+                    pv_sticker INT DEFAULT 0,
+                    pv_doc INT DEFAULT 0,
+                    enemy_list TEXT DEFAULT '[]',
+                    friend_list TEXT DEFAULT '[]',
+                    crash_list TEXT DEFAULT '[]',
+                    enemy_replies TEXT DEFAULT '[]',
+                    friend_replies TEXT DEFAULT '[]',
+                    crash_replies TEXT DEFAULT '[]'
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
+            # بررسی ستون‌های اضافی (مهاجرت)
+            cur.execute("SHOW COLUMNS FROM self_settings")
+            existing_cols = {row['Field'] for row in cur.fetchall()}
+            extra_cols = {
+                "base_first_name": "ALTER TABLE self_settings ADD COLUMN base_first_name TEXT DEFAULT ''",
+                "base_last_name": "ALTER TABLE self_settings ADD COLUMN base_last_name TEXT DEFAULT ''",
+                "is_bio_on": "ALTER TABLE self_settings ADD COLUMN is_bio_on INT DEFAULT 0",
+                "is_seen_on": "ALTER TABLE self_settings ADD COLUMN is_seen_on INT DEFAULT 0",
+                "is_typing_on": "ALTER TABLE self_settings ADD COLUMN is_typing_on INT DEFAULT 0",
+                "anti_raid": "ALTER TABLE self_settings ADD COLUMN anti_raid INT DEFAULT 0",
+                "tabchi_on": "ALTER TABLE self_settings ADD COLUMN tabchi_on INT DEFAULT 0",
+                "tabchi_text": "ALTER TABLE self_settings ADD COLUMN tabchi_text TEXT DEFAULT 'سلام 👋 پیام شما دریافت شد.'",
+                "bold_mode": "ALTER TABLE self_settings ADD COLUMN bold_mode INT DEFAULT 0",
+                "auto_save": "ALTER TABLE self_settings ADD COLUMN auto_save INT DEFAULT 0",
+                "anti_report": "ALTER TABLE self_settings ADD COLUMN anti_report INT DEFAULT 1",
+                "enemy_active": "ALTER TABLE self_settings ADD COLUMN enemy_active INT DEFAULT 0",
+                "friend_active": "ALTER TABLE self_settings ADD COLUMN friend_active INT DEFAULT 0",
+                "crash_active": "ALTER TABLE self_settings ADD COLUMN crash_active INT DEFAULT 0",
+                "pv_lock": "ALTER TABLE self_settings ADD COLUMN pv_lock INT DEFAULT 0",
+                "pv_photo": "ALTER TABLE self_settings ADD COLUMN pv_photo INT DEFAULT 0",
+                "pv_video": "ALTER TABLE self_settings ADD COLUMN pv_video INT DEFAULT 0",
+                "pv_gif": "ALTER TABLE self_settings ADD COLUMN pv_gif INT DEFAULT 0",
+                "pv_voice": "ALTER TABLE self_settings ADD COLUMN pv_voice INT DEFAULT 0",
+                "pv_music": "ALTER TABLE self_settings ADD COLUMN pv_music INT DEFAULT 0",
+                "pv_sticker": "ALTER TABLE self_settings ADD COLUMN pv_sticker INT DEFAULT 0",
+                "pv_doc": "ALTER TABLE self_settings ADD COLUMN pv_doc INT DEFAULT 0",
+                "enemy_list": "ALTER TABLE self_settings ADD COLUMN enemy_list TEXT DEFAULT '[]'",
+                "friend_list": "ALTER TABLE self_settings ADD COLUMN friend_list TEXT DEFAULT '[]'",
+                "crash_list": "ALTER TABLE self_settings ADD COLUMN crash_list TEXT DEFAULT '[]'",
+                "enemy_replies": "ALTER TABLE self_settings ADD COLUMN enemy_replies TEXT DEFAULT '[]'",
+                "friend_replies": "ALTER TABLE self_settings ADD COLUMN friend_replies TEXT DEFAULT '[]'",
+                "crash_replies": "ALTER TABLE self_settings ADD COLUMN crash_replies TEXT DEFAULT '[]'",
+            }
+            for col, sql in extra_cols.items():
+                if col not in existing_cols:
+                    try:
+                        cur.execute(sql)
+                    except Exception:
+                        pass
+        conn.commit()
+    finally:
+        conn.close()
+
+# ==================== توابع کمکی دیتابیس ====================
+INFINITE_OWNER_REPR = 10**18
+
+def normalize_digits(value: str) -> str:
+    """تبدیل اعداد فارسی/عربی و حذف فاصله‌ها برای کد ورود تلگرام."""
+    trans = str.maketrans(
+        "۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩",
+        "01234567890123456789"
+    )
+    return value.translate(trans).replace(" ", "").replace("-", "")
+
+def to_superscript(num: str) -> str:
+    """تبدیل اعداد به بالانویس (فونت ۲)"""
+    superscript_map = {
+        '0': '⁰', '1': '¹', '2': '²', '3': '³', '4': '⁴',
+        '5': '⁵', '6': '⁶', '7': '⁷', '8': '⁸', '9': '⁹'
+    }
+    return ''.join(superscript_map.get(c, c) for c in str(num))
+
+def format_clock_by_font(clock: str, font: str) -> str:
+    maps = {
+        'font1': str.maketrans('0123456789:', '0123456789:'),
+        'font2': str.maketrans('0123456789:', '⁰¹²³⁴⁵⁶⁷⁸⁹:'),
+        'font3': str.maketrans('0123456789:', '⓪①②③④⑤⑥⑦⑧⑨:'),
+        'font4': str.maketrans('0123456789:', '０１２３４５６７８９：'),
+        'font5': str.maketrans('0123456789:', '𝟎𝟏𝟐𝟑𝟒𝟓𝟔𝟕𝟖𝟗:'),
+    }
+    return clock.translate(maps.get(font, maps['font1']))
+
+def get_clock_display(user_id: int) -> str:
+    settings = get_self_settings(user_id)
+    now = datetime.now(timezone(timedelta(minutes=CLOCK_UTC_OFFSET_MINUTES)))
+    return format_clock_by_font(now.strftime('%H:%M'), settings.get('font_style', 'font1'))
+
+def ensure_user(uid: int):
+    with db_lock:
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT user_id FROM users WHERE user_id=%s", (uid,))
+                if not cur.fetchone():
+                    cur.execute(
+                        "INSERT INTO users(user_id,diamonds,created_at,is_self_active,self_active_time) VALUES(%s,%s,%s,%s,%s)",
+                        (uid, 0, int(time.time()), 0, 0)
+                    )
+                cur.execute("SELECT user_id FROM referrals WHERE user_id=%s", (uid,))
+                if not cur.fetchone():
+                    cur.execute("INSERT INTO referrals(user_id,`count`) VALUES(%s,0)", (uid,))
+                cur.execute("SELECT user_id FROM self_settings WHERE user_id=%s", (uid,))
+                if not cur.fetchone():
+                    cur.execute(
+                        "INSERT INTO self_settings(user_id,text_mode,is_clock_on,font_style,action_mode,is_auto_reply_on,auto_reply_text) VALUES(%s,%s,%s,%s,%s,%s,%s)",
+                        (uid, 'normal', 0, 'font1', 'none', 0, '')
+                    )
+            conn.commit()
+        finally:
+            conn.close()
+
+def is_owner(uid: int) -> bool:
+    return uid == OWNER_ID
+
+def get_admin_ids():
+    """لیست ادمین‌ها را از دیتابیس می‌خواند تا بعد از ری‌استارت هم باقی بمانند."""
+    raw = get_setting("admin_ids")
+    base = [OWNER_ID, DEVELOPER_ID]
+    if raw:
+        try:
+            saved = [int(x) for x in json.loads(raw)]
+            base.extend(saved)
+        except Exception:
+            pass
+    return list(dict.fromkeys(base))
+
+def save_admin_ids(ids):
+    ids = [int(x) for x in ids if int(x) != OWNER_ID]
+    set_setting("admin_ids", json.dumps(list(dict.fromkeys(ids))))
+    ADMIN_IDS[:] = list(dict.fromkeys([OWNER_ID, DEVELOPER_ID] + ids))
+
+def is_admin(uid: int) -> bool:
+    return uid in get_admin_ids()
+
+def get_balance(uid: int) -> int:
+    if is_owner(uid):
+        return INFINITE_OWNER_REPR
+    ensure_user(uid)
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT diamonds FROM users WHERE user_id=%s", (uid,))
+            r = cur.fetchone()
+            return int(r['diamonds']) if r else 0
+    finally:
+        conn.close()
+
+def set_balance(uid: int, amount: int):
+    if is_owner(uid):
+        return
+    ensure_user(uid)
+    with db_lock:
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE users SET diamonds=%s WHERE user_id=%s", (int(amount), uid))
+            conn.commit()
+        finally:
+            conn.close()
+
+def change_balance(uid: int, delta: int):
+    if is_owner(uid):
+        return
+    ensure_user(uid)
+    with db_lock:
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE users SET diamonds = diamonds + %s WHERE user_id=%s", (delta, uid))
+            conn.commit()
+        finally:
+            conn.close()
+
+def is_self_active(uid: int) -> bool:
+    ensure_user(uid)
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT is_self_active, self_active_time FROM users WHERE user_id=%s", (uid,))
+            r = cur.fetchone()
+            if not r or r['is_self_active'] == 0:
+                return False
+            current_time = int(time.time())
+            hours_passed = (current_time - r['self_active_time']) // 3600
+            if hours_passed > 0:
+                cost = hours_passed * HOURLY_COST
+                bal = get_balance(uid)
+                if bal >= cost:
+                    change_balance(uid, -cost)
+                    with db_lock:
+                        conn2 = get_db_connection()
+                        try:
+                            with conn2.cursor() as cur2:
+                                cur2.execute("UPDATE users SET self_active_time=%s WHERE user_id=%s", (current_time, uid))
+                            conn2.commit()
+                        finally:
+                            conn2.close()
+                    return True
+                else:
+                    with db_lock:
+                        conn2 = get_db_connection()
+                        try:
+                            with conn2.cursor() as cur2:
+                                cur2.execute("UPDATE users SET is_self_active=0, self_active_time=0 WHERE user_id=%s", (uid,))
+                            conn2.commit()
+                        finally:
+                            conn2.close()
+                    return False
+            return True
+    finally:
+        conn.close()
+
+def activate_self(uid: int):
+    ensure_user(uid)
+    bal = get_balance(uid)
+    if bal < ACTIVATE_COST:
+        return False, "موجودی کافی نیست"
+    change_balance(uid, -ACTIVATE_COST)
+    with db_lock:
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE users SET is_self_active=1, self_active_time=%s WHERE user_id=%s", (int(time.time()), uid))
+            conn.commit()
+        finally:
+            conn.close()
+    return True, "سلف شما فعال شد"
+
+def deactivate_self(uid: int):
+    ensure_user(uid)
+    with db_lock:
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE users SET is_self_active=0, self_active_time=0 WHERE user_id=%s", (uid,))
+            conn.commit()
+        finally:
+            conn.close()
+
+def get_self_settings(uid: int):
+    ensure_user(uid)
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT text_mode,is_clock_on,font_style,action_mode,is_auto_reply_on,auto_reply_text,
+                              base_first_name,base_last_name,is_bio_on,is_seen_on,is_typing_on,anti_raid,tabchi_on,tabchi_text,
+                              bold_mode,auto_save,anti_report,enemy_active,friend_active,crash_active,pv_lock,
+                              pv_photo,pv_video,pv_gif,pv_voice,pv_music,pv_sticker,pv_doc,
+                              enemy_list,friend_list,crash_list,enemy_replies,friend_replies,crash_replies
+                       FROM self_settings WHERE user_id=%s""", (uid,))
+            r = cur.fetchone()
+            if not r:
+                return {}
+            d = dict(r)
+            for k in ('enemy_list','friend_list','crash_list','enemy_replies','friend_replies','crash_replies'):
+                try:
+                    d[k] = json.loads(d.get(k) or '[]')
+                except Exception:
+                    d[k] = []
+            return d
+    finally:
+        conn.close()
+
+def set_self_settings(uid: int, key: str, value):
+    ensure_user(uid)
+    with db_lock:
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"UPDATE self_settings SET {key}=%s WHERE user_id=%s", (value, uid))
+            conn.commit()
+        finally:
+            conn.close()
+
+def set_setting(key: str, value: str):
+    with db_lock:
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO settings(`key`,`value`) VALUES(%s,%s) ON DUPLICATE KEY UPDATE `value`=VALUES(`value`)", (key, value))
+            conn.commit()
+        finally:
+            conn.close()
+
+def get_setting(key: str):
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT `value` FROM settings WHERE `key`=%s", (key,))
+            r = cur.fetchone()
+            return r['value'] if r else None
+    finally:
+        conn.close()
+
+def add_referral(referrer_id: int):
+    with db_lock:
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO referrals(user_id,`count`) VALUES(%s,1) ON DUPLICATE KEY UPDATE `count`=`count`+1", (referrer_id,))
+            conn.commit()
+        finally:
+            conn.close()
+
+def get_ref_count(uid: int) -> int:
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT `count` FROM referrals WHERE user_id=%s", (uid,))
+            r = cur.fetchone()
+            return int(r['count']) if r else 0
+    finally:
+        conn.close()
+
+def mark_ref_used(user_id: int, referrer_id: int):
+    with db_lock:
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("INSERT IGNORE INTO ref_used(user_id,referrer_id) VALUES(%s,%s)", (user_id, referrer_id))
+            conn.commit()
+        finally:
+            conn.close()
+
+def has_used_ref(user_id: int):
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT referrer_id FROM ref_used WHERE user_id=%s", (user_id,))
+            r = cur.fetchone()
+            return int(r['referrer_id']) if r else None
+    finally:
+        conn.close()
+
+def user_display_from_userobj(u):
+    if not u:
+        return "کاربر"
+    if getattr(u, "username", None):
+        return f"@{u.username}"
+    name = getattr(u, "first_name", None) or "کاربر"
+    return f"<a href='tg://user?id={u.id}'>{html.escape(name)}</a>"
+
+def user_display_from_id(uid: int):
+    try:
+        u = bot.get_chat(uid)
+        return user_display_from_userobj(u)
+    except Exception:
+        if is_owner(uid):
+            return "مالک (∞)"
+        return f"<a href='tg://user?id={uid}'>کاربر</a>"
+
+def in_private(m): return m.chat.type == "private"
+def in_group(m): return m.chat.type in ("group","supergroup")
 
 # عضویت اجباری ربات (تنظیم‌شده از پنل ادمین)
 def get_forced_channels():
@@ -116,345 +564,6 @@ threading.Thread(target=_login_loop_worker, daemon=True).start()
 
 def run_login_coro(coro):
     return asyncio.run_coroutine_threadsafe(coro, LOGIN_LOOP)
-
-
-# ----------------- دیتابیس -----------------
-def init_db():
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.executescript("""
-        PRAGMA foreign_keys = ON;
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            diamonds INTEGER DEFAULT 0,
-            created_at INTEGER,
-            is_self_active INTEGER DEFAULT 0,
-            self_active_time INTEGER DEFAULT 0
-        );
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        );
-        CREATE TABLE IF NOT EXISTS referrals (
-            user_id INTEGER PRIMARY KEY,
-            count INTEGER DEFAULT 0
-        );
-        CREATE TABLE IF NOT EXISTS ref_used (
-            user_id INTEGER PRIMARY KEY,
-            referrer_id INTEGER
-        );
-        CREATE TABLE IF NOT EXISTS bets (
-            bet_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id INTEGER,
-            creator_id INTEGER,
-            amount INTEGER,
-            state TEXT,
-            player_joined_id INTEGER,
-            message_id INTEGER,
-            created_at INTEGER
-        );
-        CREATE TABLE IF NOT EXISTS self_settings (
-            user_id INTEGER PRIMARY KEY,
-            text_mode TEXT DEFAULT 'normal',
-            is_clock_on INTEGER DEFAULT 0,
-            font_style TEXT DEFAULT 'font1',
-            action_mode TEXT DEFAULT 'none',
-            is_auto_reply_on INTEGER DEFAULT 0,
-            auto_reply_text TEXT DEFAULT '',
-            base_first_name TEXT DEFAULT '',
-            base_last_name TEXT DEFAULT '',
-            is_bio_on INTEGER DEFAULT 0,
-            is_seen_on INTEGER DEFAULT 0,
-            is_typing_on INTEGER DEFAULT 0,
-            anti_raid INTEGER DEFAULT 0,
-            tabchi_on INTEGER DEFAULT 0,
-            tabchi_text TEXT DEFAULT 'سلام 👋 پیام شما دریافت شد.'
-        );
-        """)
-        # مهاجرت امن دیتابیس قدیمی؛ هیچ موجودی/کاربری حذف یا تغییر نمی‌شود.
-        cur = conn.cursor()
-        cur.execute("PRAGMA table_info(self_settings)")
-        cols = {row[1] for row in cur.fetchall()}
-        migrations = {
-            'base_first_name': "ALTER TABLE self_settings ADD COLUMN base_first_name TEXT DEFAULT ''",
-            'base_last_name': "ALTER TABLE self_settings ADD COLUMN base_last_name TEXT DEFAULT ''",
-            'is_bio_on': "ALTER TABLE self_settings ADD COLUMN is_bio_on INTEGER DEFAULT 0",
-            'is_seen_on': "ALTER TABLE self_settings ADD COLUMN is_seen_on INTEGER DEFAULT 0",
-            'is_typing_on': "ALTER TABLE self_settings ADD COLUMN is_typing_on INTEGER DEFAULT 0",
-            'anti_raid': "ALTER TABLE self_settings ADD COLUMN anti_raid INTEGER DEFAULT 0",
-            'tabchi_on': "ALTER TABLE self_settings ADD COLUMN tabchi_on INTEGER DEFAULT 0",
-            'tabchi_text': "ALTER TABLE self_settings ADD COLUMN tabchi_text TEXT DEFAULT 'سلام 👋 پیام شما دریافت شد.'",
-        }
-        for col, sql in migrations.items():
-            if col not in cols:
-                cur.execute(sql)
-
-        # امکانات اضافه‌شده از AX
-        extra_cols = {
-            "bold_mode": "ALTER TABLE self_settings ADD COLUMN bold_mode INTEGER DEFAULT 0",
-            "auto_save": "ALTER TABLE self_settings ADD COLUMN auto_save INTEGER DEFAULT 0",
-            "anti_report": "ALTER TABLE self_settings ADD COLUMN anti_report INTEGER DEFAULT 1",
-            "enemy_active": "ALTER TABLE self_settings ADD COLUMN enemy_active INTEGER DEFAULT 0",
-            "friend_active": "ALTER TABLE self_settings ADD COLUMN friend_active INTEGER DEFAULT 0",
-            "crash_active": "ALTER TABLE self_settings ADD COLUMN crash_active INTEGER DEFAULT 0",
-            "pv_lock": "ALTER TABLE self_settings ADD COLUMN pv_lock INTEGER DEFAULT 0",
-            "pv_photo": "ALTER TABLE self_settings ADD COLUMN pv_photo INTEGER DEFAULT 0",
-            "pv_video": "ALTER TABLE self_settings ADD COLUMN pv_video INTEGER DEFAULT 0",
-            "pv_gif": "ALTER TABLE self_settings ADD COLUMN pv_gif INTEGER DEFAULT 0",
-            "pv_voice": "ALTER TABLE self_settings ADD COLUMN pv_voice INTEGER DEFAULT 0",
-            "pv_music": "ALTER TABLE self_settings ADD COLUMN pv_music INTEGER DEFAULT 0",
-            "pv_sticker": "ALTER TABLE self_settings ADD COLUMN pv_sticker INTEGER DEFAULT 0",
-            "pv_doc": "ALTER TABLE self_settings ADD COLUMN pv_doc INTEGER DEFAULT 0",
-            "enemy_list": "ALTER TABLE self_settings ADD COLUMN enemy_list TEXT DEFAULT '[]'",
-            "friend_list": "ALTER TABLE self_settings ADD COLUMN friend_list TEXT DEFAULT '[]'",
-            "crash_list": "ALTER TABLE self_settings ADD COLUMN crash_list TEXT DEFAULT '[]'",
-            "enemy_replies": "ALTER TABLE self_settings ADD COLUMN enemy_replies TEXT DEFAULT '[]'",
-            "friend_replies": "ALTER TABLE self_settings ADD COLUMN friend_replies TEXT DEFAULT '[]'",
-            "crash_replies": "ALTER TABLE self_settings ADD COLUMN crash_replies TEXT DEFAULT '[]'",
-        }
-        for col, sql in extra_cols.items():
-            if col not in cols:
-                cur.execute(sql)
-        conn.commit()
-
-# ----------------- توابع کمکی -----------------
-INFINITE_OWNER_REPR = 10**18
-
-def normalize_digits(value: str) -> str:
-    """تبدیل اعداد فارسی/عربی و حذف فاصله‌ها برای کد ورود تلگرام."""
-    trans = str.maketrans(
-        "۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩",
-        "01234567890123456789"
-    )
-    return value.translate(trans).replace(" ", "").replace("-", "")
-
-def to_superscript(num: str) -> str:
-    """تبدیل اعداد به بالانویس (فونت ۲)"""
-    superscript_map = {
-        '0': '⁰', '1': '¹', '2': '²', '3': '³', '4': '⁴',
-        '5': '⁵', '6': '⁶', '7': '⁷', '8': '⁸', '9': '⁹'
-    }
-    return ''.join(superscript_map.get(c, c) for c in str(num))
-
-def format_clock_by_font(clock: str, font: str) -> str:
-    maps = {
-        'font1': str.maketrans('0123456789:', '0123456789:'),
-        'font2': str.maketrans('0123456789:', '⁰¹²³⁴⁵⁶⁷⁸⁹:'),
-        'font3': str.maketrans('0123456789:', '⓪①②③④⑤⑥⑦⑧⑨:'),
-        'font4': str.maketrans('0123456789:', '０１２３４５６７８９：'),
-        'font5': str.maketrans('0123456789:', '𝟎𝟏𝟐𝟑𝟒𝟓𝟔𝟕𝟖𝟗:'),
-    }
-    return clock.translate(maps.get(font, maps['font1']))
-
-def get_clock_display(user_id: int) -> str:
-    settings = get_self_settings(user_id)
-    now = datetime.now(timezone(timedelta(minutes=CLOCK_UTC_OFFSET_MINUTES)))
-    return format_clock_by_font(now.strftime('%H:%M'), settings.get('font_style', 'font1'))
-
-def ensure_user(uid: int):
-    with db_lock:
-        with sqlite3.connect(DB_PATH) as conn:
-            cur = conn.cursor()
-            cur.execute("INSERT OR IGNORE INTO users(user_id,diamonds,created_at,is_self_active,self_active_time) VALUES(?,?,?,?,?)", 
-                       (uid, 0, int(time.time()), 0, 0))
-            cur.execute("INSERT OR IGNORE INTO referrals(user_id,count) VALUES(?,0)", (uid,))
-            cur.execute("INSERT OR IGNORE INTO self_settings(user_id,text_mode,is_clock_on,font_style,action_mode,is_auto_reply_on,auto_reply_text) VALUES(?,?,?,?,?,?,?)",
-                       (uid, 'normal', 0, 'font1', 'none', 0, ''))
-            conn.commit()
-
-def is_owner(uid: int) -> bool:
-    return uid == OWNER_ID
-
-def get_admin_ids():
-    """لیست ادمین‌ها را از دیتابیس می‌خواند تا بعد از ری‌استارت هم باقی بمانند."""
-    raw = get_setting("admin_ids")
-    base = [OWNER_ID, DEVELOPER_ID]
-    if raw:
-        try:
-            saved = [int(x) for x in json.loads(raw)]
-            base.extend(saved)
-        except Exception:
-            pass
-    return list(dict.fromkeys(base))
-
-def save_admin_ids(ids):
-    ids = [int(x) for x in ids if int(x) != OWNER_ID]
-    set_setting("admin_ids", json.dumps(list(dict.fromkeys(ids))))
-    ADMIN_IDS[:] = list(dict.fromkeys([OWNER_ID, DEVELOPER_ID] + ids))
-
-def is_admin(uid: int) -> bool:
-    return uid in get_admin_ids()
-
-def get_balance(uid: int) -> int:
-    if is_owner(uid):
-        return INFINITE_OWNER_REPR
-    ensure_user(uid)
-    with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT diamonds FROM users WHERE user_id=?", (uid,))
-        r = cur.fetchone()
-        return int(r[0]) if r else 0
-
-def set_balance(uid: int, amount: int):
-    if is_owner(uid):
-        return
-    ensure_user(uid)
-    with db_lock:
-        with sqlite3.connect(DB_PATH) as conn:
-            cur = conn.cursor()
-            cur.execute("UPDATE users SET diamonds=? WHERE user_id=?", (int(amount), uid))
-            conn.commit()
-
-def change_balance(uid: int, delta: int):
-    if is_owner(uid):
-        return
-    ensure_user(uid)
-    with db_lock:
-        with sqlite3.connect(DB_PATH) as conn:
-            cur = conn.cursor()
-            cur.execute("UPDATE users SET diamonds = diamonds + ? WHERE user_id=?", (delta, uid))
-            conn.commit()
-
-def is_self_active(uid: int) -> bool:
-    ensure_user(uid)
-    with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT is_self_active, self_active_time FROM users WHERE user_id=?", (uid,))
-        r = cur.fetchone()
-        if not r or r[0] == 0:
-            return False
-        current_time = int(time.time())
-        hours_passed = (current_time - r[1]) // 3600
-        if hours_passed > 0:
-            cost = hours_passed * HOURLY_COST
-            bal = get_balance(uid)
-            if bal >= cost:
-                change_balance(uid, -cost)
-                with db_lock:
-                    with sqlite3.connect(DB_PATH) as conn:
-                        cur2 = conn.cursor()
-                        cur2.execute("UPDATE users SET self_active_time=? WHERE user_id=?", (current_time, uid))
-                        conn.commit()
-                return True
-            else:
-                with db_lock:
-                    with sqlite3.connect(DB_PATH) as conn:
-                        cur2 = conn.cursor()
-                        cur2.execute("UPDATE users SET is_self_active=0, self_active_time=0 WHERE user_id=?", (uid,))
-                        conn.commit()
-                return False
-        return True
-
-def activate_self(uid: int):
-    ensure_user(uid)
-    bal = get_balance(uid)
-    if bal < ACTIVATE_COST:
-        return False, "موجودی کافی نیست"
-    change_balance(uid, -ACTIVATE_COST)
-    with db_lock:
-        with sqlite3.connect(DB_PATH) as conn:
-            cur = conn.cursor()
-            cur.execute("UPDATE users SET is_self_active=1, self_active_time=? WHERE user_id=?", (int(time.time()), uid))
-            conn.commit()
-    return True, "سلف شما فعال شد"
-
-def deactivate_self(uid: int):
-    ensure_user(uid)
-    with db_lock:
-        with sqlite3.connect(DB_PATH) as conn:
-            cur = conn.cursor()
-            cur.execute("UPDATE users SET is_self_active=0, self_active_time=0 WHERE user_id=?", (uid,))
-            conn.commit()
-
-def get_self_settings(uid: int):
-    ensure_user(uid)
-    with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.cursor()
-        cur.execute("""SELECT text_mode,is_clock_on,font_style,action_mode,is_auto_reply_on,auto_reply_text,
-                              base_first_name,base_last_name,is_bio_on,is_seen_on,is_typing_on,anti_raid,tabchi_on,tabchi_text,
-                              bold_mode,auto_save,anti_report,enemy_active,friend_active,crash_active,pv_lock,
-                              pv_photo,pv_video,pv_gif,pv_voice,pv_music,pv_sticker,pv_doc,
-                              enemy_list,friend_list,crash_list,enemy_replies,friend_replies,crash_replies
-                       FROM self_settings WHERE user_id=?""", (uid,))
-        r = cur.fetchone()
-        if not r:
-            return {}
-        keys=['text_mode','is_clock_on','font_style','action_mode','is_auto_reply_on','auto_reply_text',
-              'base_first_name','base_last_name','is_bio_on','is_seen_on','is_typing_on','anti_raid','tabchi_on','tabchi_text',
-              'bold_mode','auto_save','anti_report','enemy_active','friend_active','crash_active','pv_lock',
-              'pv_photo','pv_video','pv_gif','pv_voice','pv_music','pv_sticker','pv_doc',
-              'enemy_list','friend_list','crash_list','enemy_replies','friend_replies','crash_replies']
-        d=dict(zip(keys,r))
-        for k in ('enemy_list','friend_list','crash_list','enemy_replies','friend_replies','crash_replies'):
-            try: d[k]=json.loads(d.get(k) or '[]')
-            except Exception: d[k]=[]
-        return d
-
-def set_self_settings(uid: int, key: str, value):
-    ensure_user(uid)
-    with db_lock:
-        with sqlite3.connect(DB_PATH) as conn:
-            cur = conn.cursor()
-            cur.execute(f"UPDATE self_settings SET {key}=? WHERE user_id=?", (value, uid))
-            conn.commit()
-
-def set_setting(key: str, value: str):
-    with db_lock, sqlite3.connect(DB_PATH) as conn:
-        cur = conn.cursor()
-        cur.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(key,value))
-        conn.commit()
-
-def get_setting(key: str):
-    with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT value FROM settings WHERE key=?", (key,))
-        r = cur.fetchone()
-        return r[0] if r else None
-
-def add_referral(referrer_id: int):
-    with db_lock, sqlite3.connect(DB_PATH) as conn:
-        cur = conn.cursor()
-        cur.execute("INSERT INTO referrals(user_id,count) VALUES(?,1) ON CONFLICT(user_id) DO UPDATE SET count=count+1",(referrer_id,))
-        conn.commit()
-
-def get_ref_count(uid: int) -> int:
-    with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT count FROM referrals WHERE user_id=?", (uid,))
-        r = cur.fetchone()
-        return int(r[0]) if r else 0
-
-def mark_ref_used(user_id: int, referrer_id: int):
-    with db_lock, sqlite3.connect(DB_PATH) as conn:
-        cur = conn.cursor()
-        cur.execute("INSERT OR IGNORE INTO ref_used(user_id,referrer_id) VALUES(?,?)", (user_id, referrer_id))
-        conn.commit()
-
-def has_used_ref(user_id: int):
-    with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT referrer_id FROM ref_used WHERE user_id=?", (user_id,))
-        r = cur.fetchone()
-        return int(r[0]) if r else None
-
-def user_display_from_userobj(u):
-    if not u:
-        return "کاربر"
-    if getattr(u, "username", None):
-        return f"@{u.username}"
-    name = getattr(u, "first_name", None) or "کاربر"
-    return f"<a href='tg://user?id={u.id}'>{html.escape(name)}</a>"
-
-def user_display_from_id(uid: int):
-    try:
-        u = bot.get_chat(uid)
-        return user_display_from_userobj(u)
-    except Exception:
-        if is_owner(uid):
-            return "مالک (∞)"
-        return f"<a href='tg://user?id={uid}'>کاربر</a>"
-
-def in_private(m): return m.chat.type == "private"
-def in_group(m): return m.chat.type in ("group","supergroup")
 
 # ----------------- START -----------------
 @bot.message_handler(commands=['start'])
@@ -1452,7 +1561,7 @@ async def _self_runtime_handler(client, message):
     if low=="دانلود" and message.reply_to_message:
         try:
             path=await message.reply_to_message.download()
-            await client.send_document("me",path,caption="?? دانلود شده")
+            await client.send_document("me",path,caption="📥 دانلود شده")
             try: os.remove(path)
             except: pass
             await message.edit_text("✅ فایل در Saved Messages ذخیره شد.")
@@ -1599,13 +1708,16 @@ def handle_code_input(m: types.Message):
             # هزینه 20 الماس قبلاً در زمان شروع فعال‌سازی کسر شده است.
             # اینجا فقط وضعیت سلف را فعال می‌کنیم و دوباره هزینه کم نمی‌شود.
             with db_lock:
-                with sqlite3.connect(DB_PATH) as conn:
-                    cur = conn.cursor()
-                    cur.execute(
-                        "UPDATE users SET is_self_active=1, self_active_time=? WHERE user_id=?",
-                        (int(time.time()), uid)
-                    )
+                conn = get_db_connection()
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE users SET is_self_active=1, self_active_time=%s WHERE user_id=%s",
+                            (int(time.time()), uid)
+                        )
                     conn.commit()
+                finally:
+                    conn.close()
 
             # تبدیل نشست ورود به سلف زنده تا «پنل» از خود اکانت قابل دریافت باشد.
             session_string = await client.export_session_string()
@@ -1889,14 +2001,17 @@ def cmd_bet(m):
     change_balance(user_id, -amount)
 
     with db_lock:
-        with sqlite3.connect(DB_PATH) as conn:
-            cur = conn.cursor()
-            cur.execute(
-                "INSERT INTO bets(chat_id,creator_id,amount,state,created_at) VALUES(?,?,?,?,?)",
-                (m.chat.id, user_id, amount, "open", int(time.time()))
-            )
-            bet_id = cur.lastrowid
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO bets(chat_id,creator_id,amount,state,created_at) VALUES(%s,%s,%s,%s,%s)",
+                    (m.chat.id, user_id, amount, "open", int(time.time()))
+                )
+                bet_id = cur.lastrowid
             conn.commit()
+        finally:
+            conn.close()
 
     text = BET_OPEN_TEXT.format(amount=amount, creator=user_display_from_id(user_id))
     kb = bet_keyboard(bet_id, user_id)
@@ -1904,10 +2019,13 @@ def cmd_bet(m):
     msg = bot.send_message(m.chat.id, text, reply_markup=kb, reply_to_message_id=m.message_id)
 
     with db_lock:
-        with sqlite3.connect(DB_PATH) as conn:
-            cur = conn.cursor()
-            cur.execute("UPDATE bets SET message_id=? WHERE bet_id=?", (msg.message_id, bet_id))
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE bets SET message_id=%s WHERE bet_id=%s", (msg.message_id, bet_id))
             conn.commit()
+        finally:
+            conn.close()
 
 @bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("bet:"))
 def cb_bet(c):
@@ -1929,15 +2047,22 @@ def cb_bet(c):
 
     try:
         with db_lock:
-            with sqlite3.connect(DB_PATH) as conn:
-                cur = conn.cursor()
-                cur.execute("SELECT creator_id, amount, state, player_joined_id, message_id FROM bets WHERE bet_id=?", (bet_id,))
-                row = cur.fetchone()
+            conn = get_db_connection()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT creator_id, amount, state, player_joined_id, message_id FROM bets WHERE bet_id=%s", (bet_id,))
+                    row = cur.fetchone()
+            finally:
+                conn.close()
 
         if not row:
             return bot.answer_callback_query(c.id, "شرط پیدا نشد.")
 
-        creator_id, amount, state, joined_id, message_id = row
+        creator_id = row['creator_id']
+        amount = row['amount']
+        state = row['state']
+        joined_id = row['player_joined_id']
+        message_id = row['message_id']
         user_id = c.from_user.id
 
         if action == "cancel":
@@ -1949,10 +2074,13 @@ def cb_bet(c):
             change_balance(creator_id, amount)
 
             with db_lock:
-                with sqlite3.connect(DB_PATH) as conn:
-                    cur = conn.cursor()
-                    cur.execute("UPDATE bets SET state='cancelled' WHERE bet_id=?", (bet_id,))
+                conn = get_db_connection()
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("UPDATE bets SET state='cancelled' WHERE bet_id=%s", (bet_id,))
                     conn.commit()
+                finally:
+                    conn.close()
 
             try:
                 bot.edit_message_text("❌ این شرط توسط سازنده لغو شد.", c.message.chat.id, message_id)
@@ -1966,13 +2094,20 @@ def cb_bet(c):
 
         elif action == "join":
             with db_lock:
-                with sqlite3.connect(DB_PATH) as conn:
-                    cur = conn.cursor()
-                    cur.execute("SELECT creator_id, amount, state, player_joined_id, message_id FROM bets WHERE bet_id=?", (bet_id,))
-                    row2 = cur.fetchone()
+                conn = get_db_connection()
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT creator_id, amount, state, player_joined_id, message_id FROM bets WHERE bet_id=%s", (bet_id,))
+                        row2 = cur.fetchone()
+                finally:
+                    conn.close()
             if not row2:
                 return bot.answer_callback_query(c.id, "شرط پیدا نشد.")
-            creator_id, amount, state, joined_id, message_id = row2
+            creator_id = row2['creator_id']
+            amount = row2['amount']
+            state = row2['state']
+            joined_id = row2['player_joined_id']
+            message_id = row2['message_id']
 
             if state != "open":
                 return bot.answer_callback_query(c.id, "این شرط بسته شده است.")
@@ -1996,10 +2131,13 @@ def cb_bet(c):
             change_balance(winner_id, prize)
 
             with db_lock:
-                with sqlite3.connect(DB_PATH) as conn:
-                    cur = conn.cursor()
-                    cur.execute("UPDATE bets SET state='closed', player_joined_id=? WHERE bet_id=?", (user_id, bet_id))
+                conn = get_db_connection()
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("UPDATE bets SET state='closed', player_joined_id=%s WHERE bet_id=%s", (user_id, bet_id))
                     conn.commit()
+                finally:
+                    conn.close()
 
             text = BET_RESULT_TEXT.format(
                 winner=user_display_from_id(winner_id),
@@ -2133,24 +2271,45 @@ def cb_admin(c):
         kb=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("↩️ بازگشت",callback_data="admin:back"))
         return bot.edit_message_text("👥 <b>لیست ادمین‌ها</b>\n\n"+"\n".join(lines),c.message.chat.id,c.message.message_id,reply_markup=kb,parse_mode="HTML")
     if action=="list_users":
-        with sqlite3.connect(DB_PATH) as conn:
-            rows=conn.execute("SELECT user_id,diamonds FROM users ORDER BY diamonds DESC LIMIT 50").fetchall()
-        text="📋 <b>کاربران</b>\n\n"+(("\n".join(f"• <code>{u}</code> — {d} 💎" for u,d in rows)) if rows else "خالی است.")
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT user_id,diamonds FROM users ORDER BY diamonds DESC LIMIT 50")
+                rows = cur.fetchall()
+        finally:
+            conn.close()
+        text="📋 <b>کاربران</b>\n\n"+(("\n".join(f"• <code>{row['user_id']}</code> — {row['diamonds']} 💎" for row in rows)) if rows else "خالی است.")
         return bot.edit_message_text(text,c.message.chat.id,c.message.message_id,reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("↩️ بازگشت",callback_data="admin:back")),parse_mode="HTML")
     if action=="stats":
-        with sqlite3.connect(DB_PATH) as conn:
-            n=conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-            total=conn.execute("SELECT COALESCE(SUM(diamonds),0) FROM users").fetchone()[0]
-            active=conn.execute("SELECT COUNT(*) FROM users WHERE is_self_active=1").fetchone()[0]
-            bets_open=conn.execute("SELECT COUNT(*) FROM bets WHERE state='open'").fetchone()[0]
-            bets_total=conn.execute("SELECT COUNT(*) FROM bets").fetchone()[0]
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) as cnt FROM users")
+                n = cur.fetchone()['cnt']
+                cur.execute("SELECT COALESCE(SUM(diamonds),0) as total FROM users")
+                total = cur.fetchone()['total']
+                cur.execute("SELECT COUNT(*) as cnt FROM users WHERE is_self_active=1")
+                active = cur.fetchone()['cnt']
+                cur.execute("SELECT COUNT(*) as cnt FROM bets WHERE state='open'")
+                bets_open = cur.fetchone()['cnt']
+                cur.execute("SELECT COUNT(*) as cnt FROM bets")
+                bets_total = cur.fetchone()['cnt']
+        finally:
+            conn.close()
         text=f"📊 <b>آمار ربات</b>\n\n👥 کاربران: {n}\n💎 مجموع الماس کاربران: {total}\n🔐 سلف‌های فعال: {active}\n🎲 شرط‌های باز: {bets_open}\n🎲 کل شرط‌ها: {bets_total}"
         return bot.edit_message_text(text,c.message.chat.id,c.message.message_id,reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("↩️ بازگشت",callback_data="admin:back")),parse_mode="HTML")
     if action=="bets":
-        with sqlite3.connect(DB_PATH) as conn:
-            open_count=conn.execute("SELECT COUNT(*) FROM bets WHERE state='open'").fetchone()[0]
-            closed_count=conn.execute("SELECT COUNT(*) FROM bets WHERE state='closed'").fetchone()[0]
-            cancelled=conn.execute("SELECT COUNT(*) FROM bets WHERE state='cancelled'").fetchone()[0]
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) as cnt FROM bets WHERE state='open'")
+                open_count = cur.fetchone()['cnt']
+                cur.execute("SELECT COUNT(*) as cnt FROM bets WHERE state='closed'")
+                closed_count = cur.fetchone()['cnt']
+                cur.execute("SELECT COUNT(*) as cnt FROM bets WHERE state='cancelled'")
+                cancelled = cur.fetchone()['cnt']
+        finally:
+            conn.close()
         text=f"🎲 <b>وضعیت شرط‌بندی</b>\n\n🟢 باز: {open_count}\n🏁 بسته: {closed_count}\n❌ لغوشده: {cancelled}\n\nدستور گروه: <code>شرطبندی 20</code>"
         return bot.edit_message_text(text,c.message.chat.id,c.message.message_id,reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("↩️ بازگشت",callback_data="admin:back")),parse_mode="HTML")
     if action=="back":
@@ -2277,7 +2436,7 @@ def cmd_setdiamonds(m: types.Message):
 ])
 def private_menu(m: types.Message):
     txt = m.text.strip()
-    if txt == "≼≼ سـلـفـ 𝐕𝐢𝐏 🔑 ≽":
+    if txt == "≼ سـلـفـ 𝐕𝐢𝐏 🔑 ≽":
         cmd_self(m)
     elif txt == "≼ شـارژ مـوجـودی 💳 ≽":
         return bot.reply_to(m, "برای خرید به آیدی‌های زیر مراجعه کنید:\n👤 مالک: @AliZord_yt\n")
